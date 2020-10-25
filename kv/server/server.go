@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/log"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -38,22 +39,104 @@ func NewServer(storage storage.Storage) *Server {
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		log.Error("get reader from storage failed. err=%s", err.Error())
+		return nil, err
+	}
+	value, err := reader.GetCF(req.GetCf(), req.GetKey())
+	if err != nil {
+		log.Error("get cf failed. err= %s", err.Error())
+	}
+	resp := &kvrpcpb.RawGetResponse{
+		Error:    getErrorStr(err),
+		Value:    value,
+		NotFound: err == nil,
+	}
+	return resp, err
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	modify := storage.Modify{
+		Data: storage.Put{
+			Key:   req.Key,
+			Value: req.Value,
+			Cf:    req.Cf,
+		},
+	}
+	err := server.storage.Write(req.Context, []storage.Modify{modify})
+	if err != nil {
+		log.Error("write data to storage failed. err=%s", err.Error())
+	}
+	resp := &kvrpcpb.RawPutResponse{
+		RegionError: nil,
+		Error:       getErrorStr(err),
+	}
+	return resp, err
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	modify := storage.Modify{
+		Data: storage.Delete{
+			Key: req.Key,
+			Cf:  req.Cf,
+		},
+	}
+	err := server.storage.Write(req.Context, []storage.Modify{modify})
+	if err != nil {
+		log.Infof("delete data to failed. err=%s", err.Error())
+		if err.Error() == "Key not found" {
+			err = nil
+		} else {
+			log.Error("delete data to failed. err=%s", err.Error())
+		}
+	}
+	resp := &kvrpcpb.RawDeleteResponse{
+		RegionError: nil,
+		Error:       getErrorStr(err),
+	}
+	log.Debug("resp: %v", resp)
+
+	return resp, err
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	var (
+		err error
+		reader storage.StorageReader
+	)
+	reader, err = server.storage.Reader(req.Context)
+
+	if err != nil {
+		log.Error("get reader from storage failed. err=%s", err.Error())
+		return nil, err
+	}
+
+	var kvPairs []*kvrpcpb.KvPair
+	it := reader.IterCF(req.GetCf())
+
+	it.Seek(req.GetStartKey())
+	for i := uint32(0); i < req.Limit; i ++ {
+		item := it.Item()
+		if !it.Valid(){
+			break
+		}
+		key := item.Key()
+		var value []byte
+		value, err = item.Value()
+		if err != nil {
+			log.Error("get value from iter failed.")
+			return nil, err
+		}
+		kvPair := &kvrpcpb.KvPair{Key: key, Value: value}
+		kvPairs = append(kvPairs, kvPair)
+		it.Next()
+	}
+	resp := &kvrpcpb.RawScanResponse{Kvs: kvPairs, Error: getErrorStr(err)}
+	return resp, err
 }
 
 // Raft commands (tinykv <-> tinykv)
@@ -122,4 +205,12 @@ func (server *Server) Coprocessor(_ context.Context, req *coppb.Request) (*coppb
 		return server.copHandler.HandleCopAnalyzeRequest(reader, req), nil
 	}
 	return nil, nil
+}
+
+func getErrorStr(err error) string {
+	if err != nil {
+		log.Debugf("err: %v", err)
+		return err.Error()
+	}
+	return ""
 }
